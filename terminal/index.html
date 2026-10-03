@@ -51,6 +51,28 @@ header{
 #stage{position:relative;flex:1;min-height:0}
 #heat,#chart,#over{position:absolute;inset:0;width:100%;height:100%}
 #over{pointer-events:none}
+.btn{all:unset;padding:6px 10px;border:1px solid var(--line);border-radius:7px;font-size:14px;color:var(--text);cursor:pointer}
+.btn.sm{padding:3px 9px;font-size:13px;align-self:center}
+.btn:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+#scr{position:fixed;inset:0;z-index:10;display:none;flex-direction:column;background:var(--bg);
+  padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+#scr.on{display:flex}
+.sh{display:flex;flex-direction:column;gap:8px;padding:8px 12px 10px;background:var(--panel);border-bottom:1px solid var(--line)}
+.sh .top{display:flex;align-items:center;gap:10px}
+.sh .top b{font-size:17px;font-weight:600}
+#sCount{margin-left:auto;color:var(--dim);font-size:13px}
+.frow{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--dim)}
+.frow > span{min-width:70px}
+.frow .seg button{padding:5px 10px;font-size:13px}
+#list{flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch}
+.row{display:grid;grid-template-columns:1fr auto auto;gap:2px 12px;padding:9px 12px;border-bottom:1px solid rgba(28,43,68,.6);cursor:pointer}
+.row:active{background:var(--panel)}
+.row.cur{background:rgba(28,43,68,.45)}
+.row .s{font-weight:600;font-size:16px}
+.row .p{font-size:15px;text-align:right}
+.row .c{font-size:14px;text-align:right;min-width:4.4em}
+.row .d{grid-column:1/-1;font-size:12px;color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.smsg{padding:14px 12px;color:var(--dim);font-size:13px}
 #note{
   position:absolute;left:8px;top:8px;font-size:12px;color:var(--dim);pointer-events:none;
   background:rgba(10,19,34,.75);padding:3px 7px;border-radius:5px;
@@ -59,7 +81,7 @@ header{
 </head>
 <body>
 <header>
-  <div class="sym"><span id="sym">—</span><span id="px">—</span><i id="dot" title="Соединение"></i></div>
+  <div class="sym"><span id="sym">—</span><span id="px">—</span><i id="dot" title="Соединение"></i><button class="btn sm" id="openScr">Скринер</button></div>
   <div class="ctl">
     <div class="seg" id="tf" role="group" aria-label="Таймфрейм">
       <button data-tf="1" class="on">1м</button><button data-tf="15">15м</button>
@@ -80,6 +102,19 @@ header{
   <div id="chart"></div>
   <canvas id="over"></canvas>
   <div id="note">Подключение…</div>
+</div>
+
+<div id="scr" role="dialog" aria-label="Скринер">
+  <div class="sh">
+    <div class="top"><button class="btn" id="sBack">← Терминал</button><b>Скринер</b><span id="sCount"></span></div>
+    <div class="frow"><span>Оборот 24ч</span>
+      <div class="seg" id="fTurn"><button data-v="50000000">≥50M</button><button data-v="100000000">≥100M</button><button data-v="300000000">≥300M</button></div></div>
+    <div class="frow"><span>Капитализ.</span>
+      <div class="seg" id="fCap"><button data-v="0">любая</button><button data-v="300000000">≥300M</button><button data-v="1000000000">≥1B</button></div></div>
+    <div class="frow"><span>Сортировка</span>
+      <div class="seg" id="fSort"><button data-v="atr">ATR%</button><button data-v="range">Диапазон</button><button data-v="turn">Оборот</button></div></div>
+  </div>
+  <div id="list"><div class="smsg">Загрузка…</div></div>
 </div>
 
 <script>
@@ -529,7 +564,7 @@ $('#tf').onclick = async e => {
 
 /* ---------- metrics strip ---------- */
 let tk = {}, oiPast = 0, oiNowRest = 0, btc = null;
-const fmtBig = v => v >= 1e9 ? (v / 1e9).toFixed(2) + 'B' : v >= 1e6 ? (v / 1e6).toFixed(1) + 'M' : (v / 1e3).toFixed(0) + 'K';
+const fmtBig = v => v >= 1e12 ? (v / 1e12).toFixed(2) + 'T' : v >= 1e9 ? (v / 1e9).toFixed(2) + 'B' : v >= 1e6 ? (v / 1e6).toFixed(1) + 'M' : (v / 1e3).toFixed(0) + 'K';
 const pad = n => String(n).padStart(2, '0');
 function signed(sel, v, txt) {
   const el = $(sel); el.textContent = (v > 0 ? '+' : '') + txt;
@@ -601,6 +636,107 @@ if (SYM === 'BTCUSDT') $('#mCorrBox').style.display = 'none';
 setInterval(updMetrics, 1000);
 setInterval(loadOi, 60000);
 setInterval(loadBtc, 60000);
+
+/* ---------- screener ---------- */
+const SF = { turn: 100000000, cap: 300000000, sort: 'atr' };
+try { Object.assign(SF, JSON.parse(localStorage.getItem('scrF') || '{}')); } catch (e) { /* defaults */ }
+let scrRows = [], caps = null, capsState = 'idle', capsTried = 0, scrTimer = null, atrBusy = false;
+const atrCache = new Map();
+// "1000PEPEUSDT" -> "pepe", "SHIB1000USDT" -> "shib", "1INCHUSDT" -> "1inch"
+const baseOf = sym => sym.replace(/USDT$/, '').replace(/^(10|100|1000|10000|100000|1000000)(?=[A-Z])/, '')
+  .replace(/1000$/, '').toLowerCase();
+
+async function loadCaps() {
+  if (capsState === 'ok' || capsState === 'loading' || Date.now() - capsTried < 120000) return;
+  capsState = 'loading'; capsTried = Date.now();
+  try {
+    const m = new Map();
+    for (const pg of [1, 2]) {
+      const r = await fetch(`https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=250&page=${pg}`);
+      if (!r.ok) throw new Error(r.status);
+      for (const c of await r.json()) { const k = String(c.symbol).toLowerCase(); if (!m.has(k)) m.set(k, c.market_cap || 0); }
+    }
+    caps = m; capsState = 'ok';
+  } catch (e) { capsState = 'fail'; }
+}
+function scrFiltered() {
+  let L = scrRows.filter(r => r.turn >= SF.turn);
+  if (capsState === 'ok' && SF.cap > 0) L = L.filter(r => (caps.get(r.base) || 0) >= SF.cap);
+  const key = SF.sort === 'turn' ? r => r.turn : SF.sort === 'range' ? r => r.range
+    : r => { const a = atrCache.get(r.s); return a ? a.v : -1; };
+  return L.sort((a, b) => key(b) - key(a));
+}
+function renderScr() {
+  const L = scrFiltered();
+  $('#sCount').textContent = scrRows.length ? `${L.length} из ${scrRows.length}` : '';
+  const capMsg = capsState === 'fail' ? '<div class="smsg">Капитализация недоступна (CoinGecko не ответил), фильтр по ней не применяется</div>' : '';
+  $('#list').innerHTML = capMsg + (L.length ? L.map(r => {
+    const a = atrCache.get(r.s), cp = capsState === 'ok' ? caps.get(r.base) : null;
+    const cap = cp ? '$' + fmtBig(cp) : capsState === 'ok' ? 'вне топ-500' : '…';
+    return `<div class="row${r.s === SYM ? ' cur' : ''}" data-s="${r.s}">
+      <span class="s">${r.s.replace(/USDT$/, '')}</span><span class="p">${r.lp}</span>
+      <span class="c ${r.chg > 0 ? 'pos' : r.chg < 0 ? 'neg' : ''}">${r.chg > 0 ? '+' : ''}${r.chg.toFixed(2)}%</span>
+      <span class="d">ATR 15м ${a ? a.v.toFixed(2) + '%' : '…'} · диап. 24ч ${r.range.toFixed(1)}% · об. $${fmtBig(r.turn)} · кап. ${cap}</span>
+    </div>`;
+  }).join('') : (scrRows.length ? '<div class="smsg">Под фильтр ничего не попало</div>' : '<div class="smsg">Загрузка…</div>'));
+}
+async function fillAtr() {
+  if (atrBusy) return; atrBusy = true;
+  const need = scrFiltered().filter(r => { const a = atrCache.get(r.s); return !a || Date.now() - a.t > 300000; })
+    .slice(0, 120).map(r => r.s);
+  let i = 0, lastR = 0;
+  const worker = async () => {
+    while (i < need.length && $('#scr').classList.contains('on')) {
+      const s = need[i++];
+      try {
+        const j = await (await fetch(`${REST}/v5/market/kline?category=linear&symbol=${s}&interval=15&limit=60`)).json();
+        const k = j.result.list.slice().reverse().map(a => ({ h: +a[2], l: +a[3], c: +a[4] }));
+        let at = null;
+        for (let n = 1; n < k.length; n++) {
+          const tr = Math.max(k[n].h - k[n].l, Math.abs(k[n].h - k[n - 1].c), Math.abs(k[n].l - k[n - 1].c));
+          at = at == null ? tr : (at * 13 + tr) / 14;
+        }
+        if (at != null && k[k.length - 1].c) atrCache.set(s, { v: at / k[k.length - 1].c * 100, t: Date.now() });
+      } catch (e) { /* skip symbol */ }
+      if (Date.now() - lastR > 400) { lastR = Date.now(); renderScr(); }
+    }
+  };
+  await Promise.all([worker(), worker(), worker(), worker()]);
+  atrBusy = false; renderScr();
+}
+async function loadScr() {
+  try {
+    const j = await (await fetch(`${REST}/v5/market/tickers?category=linear`)).json();
+    scrRows = j.result.list.filter(t => /^[A-Z0-9]+USDT$/.test(t.symbol) && +t.turnover24h > 0).map(t => {
+      const last = +t.lastPrice, hi = +t.highPrice24h, lo = +t.lowPrice24h;
+      return { s: t.symbol, base: baseOf(t.symbol), lp: t.lastPrice, chg: +t.price24hPcnt * 100,
+               range: last ? (hi - lo) / last * 100 : 0, turn: +t.turnover24h };
+    });
+  } catch (e) { $('#list').innerHTML = '<div class="smsg">Не удалось загрузить список с биржи</div>'; return; }
+  renderScr();
+  await loadCaps(); renderScr();
+  fillAtr();
+}
+function segInit(id, key) {
+  const box = $(id), val = v => key === 'sort' ? v : +v;
+  const mark = () => box.querySelectorAll('button').forEach(b => b.classList.toggle('on', val(b.dataset.v) === SF[key]));
+  mark();
+  box.onclick = e => {
+    const b = e.target.closest('button'); if (!b) return;
+    SF[key] = val(b.dataset.v); mark();
+    try { localStorage.setItem('scrF', JSON.stringify(SF)); } catch (err) { /* not critical */ }
+    renderScr(); fillAtr();
+  };
+}
+segInit('#fTurn', 'turn'); segInit('#fCap', 'cap'); segInit('#fSort', 'sort');
+function closeScr() { $('#scr').classList.remove('on'); clearInterval(scrTimer); }
+$('#openScr').onclick = () => {
+  $('#scr').classList.add('on'); history.pushState({ scr: 1 }, '');
+  renderScr(); loadScr(); clearInterval(scrTimer); scrTimer = setInterval(loadScr, 60000);
+};
+$('#sBack').onclick = () => history.back();
+window.addEventListener('popstate', closeScr);
+$('#list').onclick = e => { const r = e.target.closest('.row'); if (r) location.search = '?s=' + r.dataset.s; };
 
 /* ---------- screen on + resume ---------- */
 let hiddenAt = 0;
