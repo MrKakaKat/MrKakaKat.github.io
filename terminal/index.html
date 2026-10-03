@@ -37,6 +37,12 @@ header{
 .seg{display:flex;align-items:center;border:1px solid var(--line);border-radius:7px;overflow:hidden}
 .seg button{all:unset;padding:6px 10px;font:inherit;font-size:14px;color:var(--dim);cursor:pointer}
 .seg button.on{background:var(--line);color:var(--text)}
+.met{flex:1 1 100%;display:grid;grid-auto-flow:column;grid-auto-columns:1fr;gap:8px;padding-top:2px}
+.m{display:flex;flex-direction:column;min-width:0;line-height:1.15}
+.m span{font-size:11px;color:var(--dim);letter-spacing:.03em}
+.m b{font-weight:600;font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.m i{font-style:normal;font-size:12px;color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pos{color:var(--live)} .neg{color:var(--down)}
 .seg button:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
 #bkv{min-width:3.4em;text-align:center;font-size:14px}
 #dot{width:8px;height:8px;border-radius:50%;background:var(--accent);flex:none;margin-left:auto;align-self:center}
@@ -61,6 +67,12 @@ header{
     <div class="seg" role="group" aria-label="Шаг цены тепловой карты">
       <button id="bkm" aria-label="Мельче">−</button><span id="bkv">—</span><button id="bkp" aria-label="Крупнее">+</button>
     </div>
+  </div>
+  <div class="met">
+    <div class="m"><span>ATR 14</span><b id="mAtr">—</b><i id="mAtrP"></i></div>
+    <div class="m"><span>OI за 1ч</span><b id="mOi">—</b><i id="mOiV"></i></div>
+    <div class="m"><span>Funding</span><b id="mFr">—</b><i id="mFrT"></i></div>
+    <div class="m" id="mCorrBox"><span>Корр. BTC</span><b id="mCorr">—</b><i>60 свечей</i></div>
   </div>
 </header>
 <div id="stage">
@@ -358,14 +370,16 @@ function drawProfile(ts, P, plotW, plotH) {
 
 /* ---------- DOM: current book as horizontal bars at the right edge ---------- */
 const fmtSz = v => v >= 1000 ? (v / 1000).toFixed(1) + 'k' : v >= 100 ? v.toFixed(0) : v.toFixed(1);
-function bookBuckets(map) {
+function bookBuckets(map, step) {
   const m = new Map();
-  for (const [p, s] of map) { const b = Math.floor(+p / bk + 1e-9); m.set(b, (m.get(b) || 0) + s); }
+  for (const [p, s] of map) { const b = Math.floor(+p / step + 1e-9); m.set(b, (m.get(b) || 0) + s); }
   return m;
 }
-function drawDom(Y, rowH, plotW, plotH) {
+function drawDom(Y, rowH0, plotW, plotH) {
   if (!bids.size || !asks.size) return;
-  const B = bookBuckets(bids), A = bookBuckets(asks);
+  const mult = Math.max(1, Math.ceil(3.5 / rowH0));   // keep rows >= ~3.5px when zoomed out
+  const st = bk * mult, rowH = rowH0 * mult;
+  const B = bookBuckets(bids, st), A = bookBuckets(asks, st);
   let mx = 0;
   for (const v of B.values()) if (v > mx) mx = v;
   for (const v of A.values()) if (v > mx) mx = v;
@@ -377,15 +391,17 @@ function drawDom(Y, rowH, plotW, plotH) {
     let top = null, topS = 0;
     hctx.fillStyle = fill;
     for (const [b, s] of m) {
-      const y = Y((b + 1) * bk);
+      const y = Y((b + 1) * st);
       if (y < -rowH || y > plotH) continue;
       const w = Math.sqrt(s / mx) * maxW;
       hctx.fillRect(plotW - w, y, w, h);
       if (s > topS) { topS = s; top = b; }
     }
     if (top == null) return;
-    hctx.fillStyle = text;
-    hctx.fillText(fmtSz(topS), plotW - Math.sqrt(topS / mx) * maxW - 4, Y((top + .5) * bk));
+    const ty = Y((top + .5) * st);
+    hctx.lineWidth = 3; hctx.strokeStyle = 'rgba(10,19,34,.85)'; hctx.lineJoin = 'round';
+    hctx.strokeText(fmtSz(topS), plotW - 4, ty);
+    hctx.fillStyle = text; hctx.fillText(fmtSz(topS), plotW - 4, ty);
   };
   side(B, 'rgba(127,220,184,.5)', '#7fdcb8');
   side(A, 'rgba(224,118,92,.55)', '#e0765c');
@@ -442,7 +458,7 @@ async function loadBars() {
       time: Math.floor(+a[0] / 1000) + TZ, open: +a[1], high: +a[2], low: +a[3], close: +a[4] }));
     if (L.length) {
       series.setData(L);
-      bars = raw.map(a => ({ h: +a[2], l: +a[3], v: +a[5] }));
+      bars = raw.map(a => ({ t: Math.floor(+a[0] / 1000) + TZ, h: +a[2], l: +a[3], c: +a[4], v: +a[5] }));
       bar0 = L[0].time; lastBarT = L[L.length - 1].time; lastClose = L[L.length - 1].close;
     }
   } catch (e) { note('История свечей не загрузилась, график строится с текущей минуты'); }
@@ -468,7 +484,7 @@ function onKline(arr) {
     const b = { time: Math.floor(k.start / 1000) + TZ, open: +k.open, high: +k.high, low: +k.low, close: +k.close };
     if (lastBarT != null && b.time < lastBarT) continue;
     if (bar0 == null) bar0 = b.time;
-    const rec = { h: b.high, l: b.low, v: +k.volume };
+    const rec = { t: b.time, h: b.high, l: b.low, c: b.close, v: +k.volume };
     if (lastBarT == null || b.time > lastBarT) bars.push(rec); else bars[bars.length - 1] = rec;
     series.update(b); lastBarT = b.time; lastClose = b.close;
   }
@@ -478,7 +494,7 @@ function connect() {
   setDot('');
   ws = new WebSocket(WSU);
   ws.onopen = () => {
-    send('subscribe', [`orderbook.${depth}.${SYM}`, `publicTrade.${SYM}`, `kline.${tf}.${SYM}`]);
+    send('subscribe', [`orderbook.${depth}.${SYM}`, `publicTrade.${SYM}`, `kline.${tf}.${SYM}`, `tickers.${SYM}`]);
     ping = setInterval(() => send('ping'), 20000);
     setDot('live');
     note(sinceText || 'Подключено');
@@ -494,6 +510,7 @@ function connect() {
     if (t.startsWith('orderbook')) onBook(m);
     else if (t.startsWith('publicTrade')) onTrades(m.data);
     else if (t.startsWith('kline')) onKline(m.data);
+    else if (t.startsWith('tickers')) { if (m.type === 'snapshot') tk = {}; Object.assign(tk, m.data); }
   };
   ws.onclose = () => { clearInterval(ping); setDot('off'); setTimeout(connect, 1500); };
   ws.onerror = () => note('Нет соединения с биржей, переподключаюсь');
@@ -507,7 +524,83 @@ $('#tf').onclick = async e => {
   document.querySelectorAll('#tf button').forEach(x => x.classList.toggle('on', x === b));
   await loadBars();
   send('subscribe', [`kline.${tf}.${SYM}`]);
+  loadBtc();
 };
+
+/* ---------- metrics strip ---------- */
+let tk = {}, oiPast = 0, oiNowRest = 0, btc = null;
+const fmtBig = v => v >= 1e9 ? (v / 1e9).toFixed(2) + 'B' : v >= 1e6 ? (v / 1e6).toFixed(1) + 'M' : (v / 1e3).toFixed(0) + 'K';
+const pad = n => String(n).padStart(2, '0');
+function signed(sel, v, txt) {
+  const el = $(sel); el.textContent = (v > 0 ? '+' : '') + txt;
+  el.className = v > 0 ? 'pos' : v < 0 ? 'neg' : '';
+}
+function atr(n = 14) {
+  if (bars.length < n + 1) return null;
+  let a = null;
+  for (let i = Math.max(1, bars.length - 200); i < bars.length; i++) {
+    const b = bars[i], pc = bars[i - 1].c;
+    const tr = Math.max(b.h - b.l, Math.abs(b.h - pc), Math.abs(b.l - pc));
+    a = a == null ? tr : (a * (n - 1) + tr) / n;      // Wilder
+  }
+  return a;
+}
+function corrBtc(n = 60) {
+  if (!btc || bars.length < 3) return null;
+  const xs = [], ys = [];
+  for (let i = Math.max(1, bars.length - n); i < bars.length; i++) {
+    const b0 = btc.get(bars[i - 1].t), b1 = btc.get(bars[i].t);
+    if (!b0 || !b1) continue;
+    xs.push(Math.log(bars[i].c / bars[i - 1].c)); ys.push(Math.log(b1 / b0));
+  }
+  if (xs.length < 20) return null;
+  const mx = xs.reduce((a, b) => a + b) / xs.length, my = ys.reduce((a, b) => a + b) / ys.length;
+  let sxy = 0, sxx = 0, syy = 0;
+  for (let i = 0; i < xs.length; i++) {
+    const dx = xs[i] - mx, dy = ys[i] - my; sxy += dx * dy; sxx += dx * dx; syy += dy * dy;
+  }
+  return sxx && syy ? sxy / Math.sqrt(sxx * syy) : null;
+}
+async function loadOi() {
+  try {
+    const j = await (await fetch(`${REST}/v5/market/open-interest?category=linear&symbol=${SYM}&intervalTime=5min&limit=13`)).json();
+    const L = j.result.list;
+    oiNowRest = +L[0].openInterest; oiPast = +L[L.length - 1].openInterest;
+  } catch (e) { /* keep last */ }
+}
+async function loadBtc() {
+  if (SYM === 'BTCUSDT') return;
+  try {
+    const j = await (await fetch(`${REST}/v5/market/kline?category=linear&symbol=BTCUSDT&interval=${tf}&limit=200`)).json();
+    btc = new Map(j.result.list.map(a => [Math.floor(+a[0] / 1000) + TZ, +a[4]]));
+  } catch (e) { /* keep last */ }
+}
+function updMetrics() {
+  const a = atr();
+  if (a != null && lastClose) {
+    $('#mAtr').textContent = a.toFixed(prec);
+    $('#mAtrP').textContent = (a / lastClose * 100).toFixed(2) + '%';
+  }
+  const oiNow = +tk.openInterest || oiNowRest;
+  if (oiPast && oiNow) { const d = (oiNow / oiPast - 1) * 100; signed('#mOi', d, d.toFixed(2) + '%'); }
+  if (tk.openInterestValue) $('#mOiV').textContent = '$' + fmtBig(+tk.openInterestValue);
+  if (tk.fundingRate != null && tk.fundingRate !== '') {
+    const r = +tk.fundingRate * 100;
+    $('#mFr').textContent = (r > 0 ? '+' : '') + r.toFixed(4) + '%';
+  }
+  if (tk.nextFundingTime) {
+    const sec = Math.max(0, Math.floor((+tk.nextFundingTime - Date.now()) / 1000));
+    $('#mFrT').textContent = `через ${Math.floor(sec / 3600)}:${pad(Math.floor(sec / 60) % 60)}:${pad(sec % 60)}`;
+  }
+  if (SYM !== 'BTCUSDT') {
+    const c = corrBtc();
+    if (c != null) $('#mCorr').textContent = c.toFixed(2);
+  }
+}
+if (SYM === 'BTCUSDT') $('#mCorrBox').style.display = 'none';
+setInterval(updMetrics, 1000);
+setInterval(loadOi, 60000);
+setInterval(loadBtc, 60000);
 
 /* ---------- screen on + resume ---------- */
 let hiddenAt = 0;
@@ -533,6 +626,7 @@ document.addEventListener('visibilitychange', () => {
   if (lastClose != null) pickBucket(lastClose);
   connect();
   keepAwake();
+  loadOi(); loadBtc();
 })();
 })();
 </script>
