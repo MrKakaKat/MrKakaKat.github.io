@@ -1,0 +1,445 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f1b2e">
+<title>Heatmap · терминал</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Barlow+Semi+Condensed:wght@400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+<style>
+:root{
+  --bg:#0a1322; --panel:#0f1b2e; --line:#1c2b44; --text:#c9d4e3; --dim:#6f819c;
+  --up:#d9e2ec; --down:#e0765c; --accent:#f2b84b; --live:#7fdcb8;
+  box-sizing:border-box;
+  padding-top:env(safe-area-inset-top,0px); padding-bottom:env(safe-area-inset-bottom,0px);
+}
+html,body{height:100%;margin:0}
+body{
+  display:flex;flex-direction:column;background:var(--bg);color:var(--text);
+  font-family:'Barlow Semi Condensed',system-ui,sans-serif;font-variant-numeric:tabular-nums;
+  overflow:hidden;-webkit-tap-highlight-color:transparent;
+}
+header{
+  display:flex;flex-wrap:wrap;gap:6px 8px;
+  padding:6px 12px 8px;background:var(--panel);border-bottom:1px solid var(--line);
+}
+.sym{flex:1 1 100%;display:flex;align-items:baseline;gap:10px;min-width:0}
+#sym{font-weight:600;font-size:14px;color:var(--dim)}
+#px{font-weight:600;font-size:22px;color:var(--up);transition:color .2s}
+#px.dn{color:var(--down)}
+.ctl{flex:1 1 100%;display:flex;align-items:center;justify-content:space-between;gap:8px}
+.seg{display:flex;align-items:center;border:1px solid var(--line);border-radius:7px;overflow:hidden}
+.seg button{all:unset;padding:6px 10px;font:inherit;font-size:14px;color:var(--dim);cursor:pointer}
+.seg button.on{background:var(--line);color:var(--text)}
+.seg button:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+#bkv{min-width:3.4em;text-align:center;font-size:14px}
+#dot{width:8px;height:8px;border-radius:50%;background:var(--accent);flex:none;margin-left:auto;align-self:center}
+#dot.live{background:var(--live)}
+#dot.off{background:var(--down)}
+#stage{position:relative;flex:1;min-height:0}
+#heat,#chart,#over{position:absolute;inset:0;width:100%;height:100%}
+#over{pointer-events:none}
+#note{
+  position:absolute;left:8px;top:8px;font-size:12px;color:var(--dim);pointer-events:none;
+  background:rgba(10,19,34,.75);padding:3px 7px;border-radius:5px;
+}
+</style>
+</head>
+<body>
+<header>
+  <div class="sym"><span id="sym">—</span><span id="px">—</span><i id="dot" title="Соединение"></i></div>
+  <div class="ctl">
+    <div class="seg" id="tf" role="group" aria-label="Таймфрейм">
+      <button data-tf="1" class="on">1м</button><button data-tf="15">15м</button>
+    </div>
+    <div class="seg" role="group" aria-label="Шаг цены тепловой карты">
+      <button id="bkm" aria-label="Мельче">−</button><span id="bkv">—</span><button id="bkp" aria-label="Крупнее">+</button>
+    </div>
+  </div>
+</header>
+<div id="stage">
+  <canvas id="heat"></canvas>
+  <div id="chart"></div>
+  <canvas id="over"></canvas>
+  <div id="note">Подключение…</div>
+</div>
+
+<script>
+(() => {
+'use strict';
+const $ = s => document.querySelector(s);
+
+/* ---------- config ---------- */
+const Q = new URLSearchParams(location.search);
+const SYM = (Q.get('s') || 'BTCUSDT').toUpperCase();
+const REST = 'https://api.bybit.com';
+const WSU = 'wss://stream.bybit.com/v5/public/linear';
+const SMS = 1000;          // heatmap column = 1 s
+const W = 3600;            // 1 hour of columns (ring)
+const H = 512;             // price rows
+const EDGE = 64;           // re-anchor margin (rows)
+const TZ = -new Date().getTimezoneOffset() * 60;
+const cs = ms => ms / 1000 + TZ;          // ms -> chart seconds (local time)
+
+/* ---------- state ---------- */
+let tf = '1', tick = 0.1, prec = 1;
+let bkList = [], bkIdx = 0, bk = null;
+let bar0 = null, lastBarT = null, lastClose = null;
+let depth = 500;
+const bids = new Map(), asks = new Map();
+let dirty = true;
+
+$('#sym').textContent = SYM;
+
+/* ---------- colormap ---------- */
+const STOPS = [
+  [0,   [16, 40, 80, 0]],
+  [.12, [22, 62, 120, 150]],
+  [.35, [18, 128, 150, 215]],
+  [.65, [236, 176, 72, 245]],
+  [1,   [255, 246, 222, 255]],
+];
+const LUT = new Uint8ClampedArray(256 * 4);
+for (let i = 0; i < 256; i++) {
+  const v = i / 255; let j = 0;
+  while (j < STOPS.length - 2 && v > STOPS[j + 1][0]) j++;
+  const [a, ca] = STOPS[j], [b, cb] = STOPS[j + 1], f = (v - a) / (b - a);
+  for (let c = 0; c < 4; c++) LUT[i * 4 + c] = ca[c] + (cb[c] - ca[c]) * f;
+}
+
+/* ---------- chart ---------- */
+const chart = LightweightCharts.createChart($('#chart'), {
+  autoSize: true,
+  layout: { background: { type: 'solid', color: 'rgba(0,0,0,0)' }, textColor: '#6f819c',
+            fontFamily: "'Barlow Semi Condensed', system-ui, sans-serif", fontSize: 12 },
+  grid: { vertLines: { color: 'rgba(28,43,68,.35)' }, horzLines: { color: 'rgba(28,43,68,.35)' } },
+  rightPriceScale: { borderColor: '#1c2b44' },
+  timeScale: { borderColor: '#1c2b44', timeVisible: true, secondsVisible: false, rightOffset: 8, barSpacing: 8 },
+  crosshair: { mode: 0 },
+});
+const series = chart.addCandlestickSeries({
+  upColor: 'rgba(0,0,0,0)', downColor: '#e0765c',
+  borderUpColor: '#d9e2ec', borderDownColor: '#e0765c',
+  wickUpColor: '#d9e2ec', wickDownColor: '#e0765c',
+});
+chart.timeScale().subscribeVisibleLogicalRangeChange(() => dirty = true);
+chart.subscribeCrosshairMove(() => dirty = true);
+const stage = $('#stage');
+['pointermove', 'pointerup', 'wheel', 'touchmove'].forEach(e =>
+  stage.addEventListener(e, () => dirty = true, { capture: true, passive: true }));
+
+/* ---------- canvases ---------- */
+const heat = $('#heat'), over = $('#over');
+const hctx = heat.getContext('2d'), octx = over.getContext('2d');
+let dpr = 1, sw = 0, sh = 0;
+function resize() {
+  dpr = Math.min(window.devicePixelRatio || 1, 2.5);
+  sw = stage.clientWidth; sh = stage.clientHeight;
+  for (const c of [heat, over]) { c.width = Math.round(sw * dpr); c.height = Math.round(sh * dpr); }
+  dirty = true;
+}
+new ResizeObserver(resize).observe(stage);
+
+/* ---------- heatmap texture (ring buffer: x = time, y = price bucket) ---------- */
+const tex = document.createElement('canvas'); tex.width = W; tex.height = H;
+const tctx = tex.getContext('2d');
+const tmp = document.createElement('canvas'); tmp.width = W; tmp.height = H;
+const mctx = tmp.getContext('2d');
+const colImg = tctx.createImageData(1, H);
+const acc = new Float32Array(H);
+let anchorTop = null, lastK = -1, hStart = 0, ref = 0, sinceText = '';
+
+function resetHeat() {
+  tctx.clearRect(0, 0, W, H);
+  anchorTop = null; lastK = -1; ref = 0;
+  hStart = Math.floor(Date.now() / SMS) * SMS;
+  const d = new Date(hStart);
+  sinceText = `Стакан копится с ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+  note(sinceText);
+  dirty = true;
+}
+
+function anchor(bm) {
+  if (anchorTop == null) { anchorTop = bm + H / 2; return; }
+  const r = anchorTop - bm;
+  if (r >= EDGE && r <= H - EDGE) return;
+  const nt = bm + H / 2, d = nt - anchorTop;
+  mctx.clearRect(0, 0, W, H); mctx.drawImage(tex, 0, 0);
+  tctx.clearRect(0, 0, W, H); tctx.drawImage(tmp, 0, d);
+  anchorTop = nt;
+}
+
+function addSide(map) {
+  for (const [p, s] of map) {
+    const r = anchorTop - Math.floor(+p / bk + 1e-9);
+    if (r >= 0 && r < H) acc[r] += s;
+  }
+}
+
+function sample() {
+  if (pend.size && Math.floor(Date.now() / 1000) > pendSec) flush();
+  if (!bids.size || !asks.size) return;
+  let bb = -Infinity, ba = Infinity;
+  for (const p of bids.keys()) { const x = +p; if (x > bb) bb = x; }
+  for (const p of asks.keys()) { const x = +p; if (x < ba) ba = x; }
+  const mid = (bb + ba) / 2;
+  if (bk == null) pickBucket(mid);
+  const k = Math.floor((Date.now() - hStart) / SMS);
+  if (k <= lastK) return;
+
+  anchor(Math.floor(mid / bk));
+  acc.fill(0); addSide(bids); addSide(asks);
+
+  const nz = [];
+  for (let r = 0; r < H; r++) if (acc[r] > 0) nz.push(acc[r]);
+  if (!nz.length) return;
+  nz.sort((a, b) => a - b);
+  const p95 = nz[Math.floor(nz.length * .95)];
+  ref = ref ? ref * .95 + p95 * .05 : p95;
+
+  const d = colImg.data, L = Math.log1p(8);
+  for (let r = 0; r < H; r++) {
+    const v = acc[r], o = r * 4;
+    if (!v) { d[o + 3] = 0; continue; }
+    const i = Math.min(255, (Math.log1p(v / ref * 4) / L * 255) | 0) * 4;
+    d[o] = LUT[i]; d[o + 1] = LUT[i + 1]; d[o + 2] = LUT[i + 2]; d[o + 3] = LUT[i + 3];
+  }
+  tctx.fillStyle = 'rgba(111,129,156,0.09)';
+  for (let j = lastK + 1; j < k && j <= lastK + W; j++) {
+    tctx.clearRect(j % W, 0, 1, H);
+    if (lastK >= 0) tctx.fillRect(j % W, 0, 1, H);   // no data (app was paused)
+  }
+  tctx.putImageData(colImg, k % W, 0);
+  lastK = k; dirty = true;
+}
+setInterval(sample, 200);
+setInterval(() => dirty = true, 500);
+
+/* ---------- large-trade bubbles ---------- */
+let pend = new Map(), pendSec = 0, clusters = [], cm = 0, lastPx = null;
+function onTrades(arr) {
+  for (const t of arr) {
+    const sec = Math.floor(t.T / 1000);
+    if (sec !== pendSec) { flush(); pendSec = sec; }
+    const p = +t.p, v = +t.v, buy = t.S === 'Buy';
+    const key = Math.floor(p / (bk || tick)) * 2 + (buy ? 1 : 0);
+    let c = pend.get(key);
+    if (!c) { c = { sec, ps: 0, v: 0, buy }; pend.set(key, c); }
+    c.ps += p * v; c.v += v;
+    if (lastPx != null) $('#px').classList.toggle('dn', p < lastPx);
+    lastPx = p;
+  }
+  if (lastPx != null) $('#px').textContent = lastPx.toFixed(prec);
+}
+function flush() {
+  for (const c of pend.values()) {
+    cm = cm ? cm * .995 + c.v * .005 : c.v;
+    if (c.v >= cm * 10) { c.p = c.ps / c.v; clusters.push(c); }
+  }
+  if (pend.size) dirty = true;
+  pend.clear();
+  const cut = Date.now() / 1000 - W * SMS / 1000;
+  while (clusters.length && clusters[0].sec < cut) clusters.shift();
+}
+
+/* ---------- render ---------- */
+function draw() {
+  hctx.setTransform(1, 0, 0, 1, 0, 0); hctx.clearRect(0, 0, heat.width, heat.height);
+  octx.setTransform(1, 0, 0, 1, 0, 0); octx.clearRect(0, 0, over.width, over.height);
+  if (bar0 == null || lastClose == null || bk == null) return;
+
+  const ts = chart.timeScale();
+  const x0 = ts.logicalToCoordinate(0), x1 = ts.logicalToCoordinate(1);
+  const yA = series.priceToCoordinate(lastClose), yB = series.priceToCoordinate(lastClose + bk * 10);
+  if (x0 == null || x1 == null || yA == null || yB == null || yA === yB) return;
+  const sp = x1 - x0, iv = +tf * 60;
+  const X = s => x0 + ((s - bar0) / iv - 0.5) * sp;
+  const Y = p => yA + (p - lastClose) * (yB - yA) / (bk * 10);
+  const plotW = sw - chart.priceScale('right').width();
+  const plotH = sh - ts.height();
+
+  // heatmap: texture is affine in (time, price) -> one or two drawImage calls
+  hctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  hctx.save(); hctx.beginPath(); hctx.rect(0, 0, plotW, plotH); hctx.clip();
+  hctx.imageSmoothingEnabled = true;
+  if (lastK >= 0 && anchorTop != null) {
+    const a = Math.max(0, lastK - W + 1), n = lastK - a + 1, p = a % W;
+    const yTop = Y((anchorTop + 1) * bk), yBot = Y((anchorTop + 1 - H) * bk);
+    const seg = (s, cnt) => {
+      const xs = X(cs(hStart + s * SMS)), xe = X(cs(hStart + (s + cnt) * SMS));
+      if (xe < 0 || xs > plotW) return;
+      hctx.drawImage(tex, s % W, 0, cnt, H, xs, yTop, xe - xs, yBot - yTop);
+    };
+    if (p + n <= W) seg(a, n); else { const n1 = W - p; seg(a, n1); seg(a + n1, n - n1); }
+  }
+  hctx.restore();
+
+  // trade bubbles
+  octx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  octx.save(); octx.beginPath(); octx.rect(0, 0, plotW, plotH); octx.clip();
+  octx.lineWidth = 1.2;
+  // merge trades that would land in the same ~8px cell at the current zoom
+  const tb = Math.max(1, Math.ceil(8 / (sp / iv)));
+  const pb = Math.abs(8 * (bk * 10) / (yB - yA));
+  const thr = cm * 10, G = new Map();
+  for (const c of clusters) {
+    const key = Math.floor(c.sec / tb) + ':' + Math.round(c.p / pb) + ':' + (c.buy ? 1 : 0);
+    let g = G.get(key);
+    if (!g) { g = { t: 0, ps: 0, v: 0, buy: c.buy }; G.set(key, g); }
+    g.t += c.sec * c.v; g.ps += c.p * c.v; g.v += c.v;
+  }
+  for (const c of G.values()) {
+    const x = X(cs(c.t / c.v * 1000 + 500)), y = Y(c.ps / c.v);
+    if (x < -20 || x > plotW + 20 || y < -20 || y > plotH + 20) continue;
+    const r = Math.min(16, 3.2 * Math.sqrt(c.v / thr));
+    octx.beginPath(); octx.arc(x, y, r, 0, Math.PI * 2);
+    octx.fillStyle = c.buy ? 'rgba(159,240,213,.14)' : 'rgba(255,138,107,.14)';
+    octx.strokeStyle = c.buy ? 'rgba(159,240,213,.9)' : 'rgba(255,138,107,.9)';
+    octx.fill(); octx.stroke();
+  }
+  octx.restore();
+}
+(function frame() { requestAnimationFrame(frame); if (dirty) { dirty = false; draw(); } })();
+
+/* ---------- bucket control ---------- */
+function makeBuckets() {
+  const out = [tick];
+  let e = Math.floor(Math.log10(tick));
+  for (let i = 0; i < 12; i++, e++)
+    for (const m of [1, 2, 5]) {
+      const v = +(m * 10 ** e).toFixed(12);
+      if (v > out[out.length - 1] * 1.0001) out.push(v);
+    }
+  return out;
+}
+function bkLabel() {
+  const d = Math.max(0, -Math.floor(Math.log10(bk) + 1e-9));
+  $('#bkv').textContent = bk.toFixed(Math.min(d, 8));
+}
+function pickBucket(price) {
+  bkList = makeBuckets();
+  const target = price * 5e-6;
+  bkIdx = bkList.findIndex(v => v >= target);
+  if (bkIdx < 0) bkIdx = bkList.length - 1;
+  bk = bkList[bkIdx]; bkLabel(); resetHeat();
+}
+function stepBucket(d) {
+  if (bk == null) return;
+  const i = Math.max(0, Math.min(bkList.length - 1, bkIdx + d));
+  if (i === bkIdx) return;
+  bkIdx = i; bk = bkList[i]; bkLabel(); resetHeat();
+}
+$('#bkm').onclick = () => stepBucket(-1);
+$('#bkp').onclick = () => stepBucket(1);
+
+/* ---------- data: REST ---------- */
+async function loadInfo() {
+  try {
+    const j = await (await fetch(`${REST}/v5/market/instruments-info?category=linear&symbol=${SYM}`)).json();
+    const t = j.result.list[0].priceFilter.tickSize;
+    tick = +t; prec = (t.split('.')[1] || '').replace(/0+$/, '').length;
+  } catch (e) { /* keep defaults */ }
+  series.applyOptions({ priceFormat: { type: 'price', precision: prec, minMove: tick } });
+}
+async function loadBars() {
+  bar0 = null; lastBarT = null; series.setData([]);
+  try {
+    const j = await (await fetch(`${REST}/v5/market/kline?category=linear&symbol=${SYM}&interval=${tf}&limit=1000`)).json();
+    const L = j.result.list.slice().reverse().map(a => ({
+      time: Math.floor(+a[0] / 1000) + TZ, open: +a[1], high: +a[2], low: +a[3], close: +a[4] }));
+    if (L.length) {
+      series.setData(L);
+      bar0 = L[0].time; lastBarT = L[L.length - 1].time; lastClose = L[L.length - 1].close;
+    }
+  } catch (e) { note('История свечей не загрузилась, график строится с текущей минуты'); }
+  dirty = true;
+}
+
+/* ---------- data: WebSocket ---------- */
+let ws, ping;
+const send = (op, args) => ws && ws.readyState === 1 && ws.send(JSON.stringify({ op, args }));
+function setDot(s) { $('#dot').className = s; }
+function note(t) { $('#note').textContent = t; }
+
+function onBook(m) {
+  const d = m.data;
+  if (m.type === 'snapshot') { bids.clear(); asks.clear(); }
+  for (const [p, s] of d.b) s === '0' ? bids.delete(p) : bids.set(p, +s);
+  for (const [p, s] of d.a) s === '0' ? asks.delete(p) : asks.set(p, +s);
+}
+function onKline(arr) {
+  for (const k of arr) {
+    if (k.interval !== tf) continue;
+    const b = { time: Math.floor(k.start / 1000) + TZ, open: +k.open, high: +k.high, low: +k.low, close: +k.close };
+    if (lastBarT != null && b.time < lastBarT) continue;
+    if (bar0 == null) bar0 = b.time;
+    series.update(b); lastBarT = b.time; lastClose = b.close;
+  }
+  dirty = true;
+}
+function connect() {
+  setDot('');
+  ws = new WebSocket(WSU);
+  ws.onopen = () => {
+    send('subscribe', [`orderbook.${depth}.${SYM}`, `publicTrade.${SYM}`, `kline.${tf}.${SYM}`]);
+    ping = setInterval(() => send('ping'), 20000);
+    setDot('live');
+    note(sinceText || 'Подключено');
+  };
+  ws.onmessage = e => {
+    const m = JSON.parse(e.data);
+    if (m.op === 'subscribe' && m.success === false) {
+      if (depth !== 200) { depth = 200; ws.close(); }
+      else note('Биржа отклонила подписку: ' + (m.ret_msg || ''));
+      return;
+    }
+    const t = m.topic; if (!t) return;
+    if (t.startsWith('orderbook')) onBook(m);
+    else if (t.startsWith('publicTrade')) onTrades(m.data);
+    else if (t.startsWith('kline')) onKline(m.data);
+  };
+  ws.onclose = () => { clearInterval(ping); setDot('off'); setTimeout(connect, 1500); };
+  ws.onerror = () => note('Нет соединения с биржей, переподключаюсь');
+}
+
+/* ---------- timeframe ---------- */
+$('#tf').onclick = async e => {
+  const b = e.target.closest('button'); if (!b || b.dataset.tf === tf) return;
+  send('unsubscribe', [`kline.${tf}.${SYM}`]);
+  tf = b.dataset.tf;
+  document.querySelectorAll('#tf button').forEach(x => x.classList.toggle('on', x === b));
+  await loadBars();
+  send('subscribe', [`kline.${tf}.${SYM}`]);
+};
+
+/* ---------- screen on + resume ---------- */
+let hiddenAt = 0;
+async function keepAwake() {
+  try { if ('wakeLock' in navigator && document.visibilityState === 'visible') await navigator.wakeLock.request('screen'); }
+  catch (e) { /* not critical */ }
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') { hiddenAt = Date.now(); return; }
+  keepAwake();
+  if (hiddenAt && Date.now() - hiddenAt > 30000) {
+    loadBars();
+    note('Пока приложение было свёрнуто, стакан не записывался: пропуск отмечен серым');
+    setTimeout(() => note(sinceText), 8000);
+  }
+  dirty = true;
+});
+
+/* ---------- boot ---------- */
+(async () => {
+  await loadInfo();
+  await loadBars();
+  if (lastClose != null) pickBucket(lastClose);
+  connect();
+  keepAwake();
+})();
+})();
+</script>
+</body>
+</html>
