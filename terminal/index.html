@@ -127,10 +127,11 @@ const Q = new URLSearchParams(location.search);
 const SYM = (Q.get('s') || 'BTCUSDT').toUpperCase();
 const REST = 'https://api.bybit.com';
 const WSU = 'wss://stream.bybit.com/v5/public/linear';
-const SMS = 1000;          // heatmap column = 1 s
-const W = 3600;            // 1 hour of columns (ring)
-const H = 512;             // price rows
-const EDGE = 64;           // re-anchor margin (rows)
+const SMS = 2000;          // heatmap column = 2 s
+const W = 1800;            // 1 hour of columns (ring)
+const H = 1024;            // price rows (room for the deep book)
+const EDGE = 128;          // re-anchor margin (rows)
+const PERSIST_MS = 15000;  // persistence filter time constant
 const TZ = -new Date().getTimezoneOffset() * 60;
 const cs = ms => ms / 1000 + TZ;          // ms -> chart seconds (local time)
 
@@ -140,7 +141,8 @@ let bkList = [], bkIdx = 0, bk = null;
 let bar0 = null, lastBarT = null, lastClose = null;
 let bars = [];              // {h, l, v} aligned with series indices (for volume profile)
 let depth = 500;
-const bids = new Map(), asks = new Map();
+const ybB = new Map(), ybA = new Map();      // Bybit book
+let bids = ybB, asks = ybA, bookSrc = 'bybit';   // active book for heatmap + DOM
 let dirty = true;
 
 $('#sym').textContent = SYM;
@@ -201,15 +203,18 @@ const tmp = document.createElement('canvas'); tmp.width = W; tmp.height = H;
 const mctx = tmp.getContext('2d');
 const colImg = tctx.createImageData(1, H);
 const acc = new Float32Array(H);
-let anchorTop = null, lastK = -1, hStart = 0, qLo = 0, qHi = 0, sinceText = '';
+let anchorTop = null, lastK = -1, hStart = 0, qLo = 0, qHi = 0, sinceHM = '';
+const pers = new Float32Array(H), shown = new Float32Array(H);
+const PA = Math.exp(-SMS / PERSIST_MS);
+const sinceText = () => sinceHM ? `Стакан ${bookSrc === 'binance' ? 'Binance' : 'Bybit'} · копится с ${sinceHM}` : '';
 
 function resetHeat() {
   tctx.clearRect(0, 0, W, H);
-  anchorTop = null; lastK = -1; qLo = 0; qHi = 0;
+  anchorTop = null; lastK = -1; qLo = 0; qHi = 0; pers.fill(0);
   hStart = Math.floor(Date.now() / SMS) * SMS;
   const d = new Date(hStart);
-  sinceText = `Стакан копится с ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
-  note(sinceText);
+  sinceHM = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+  note(sinceText());
   dirty = true;
 }
 
@@ -220,6 +225,9 @@ function anchor(bm) {
   const nt = bm + H / 2, d = nt - anchorTop;
   mctx.clearRect(0, 0, W, H); mctx.drawImage(tex, 0, 0);
   tctx.clearRect(0, 0, W, H); tctx.drawImage(tmp, 0, d);
+  if (Math.abs(d) >= H) pers.fill(0);
+  else if (d > 0) { pers.copyWithin(d, 0, H - d); pers.fill(0, 0, d); }
+  else if (d < 0) { pers.copyWithin(0, -d); pers.fill(0, H + d); }
   anchorTop = nt;
 }
 
@@ -245,7 +253,11 @@ function sample() {
   acc.fill(0); addSide(bids); addSide(asks);
 
   const nz = [];
-  for (let r = 0; r < H; r++) if (acc[r] > 0) nz.push(acc[r]);
+  for (let r = 0; r < H; r++) {
+    pers[r] = pers[r] * PA + acc[r] * (1 - PA);
+    shown[r] = acc[r] > 0 ? Math.min(acc[r], pers[r]) : 0;   // fresh/flickering orders stay dim
+    if (shown[r] > 0) nz.push(shown[r]);
+  }
   if (!nz.length) return;
   nz.sort((a, b) => a - b);
   const q50 = nz[nz.length >> 1];
@@ -255,7 +267,7 @@ function sample() {
   const la = Math.log(qLo), span = Math.max(1e-6, Math.log(qHi) - la);
   const d = colImg.data;
   for (let r = 0; r < H; r++) {
-    const v = acc[r], o = r * 4;
+    const v = shown[r], o = r * 4;
     if (!v) { d[o + 3] = 0; continue; }
     const t = Math.min(1, Math.max(0, (Math.log(v) - la) / span));
     const i = ((0.08 + 0.92 * t * t) * 255 | 0) * 4;
@@ -461,7 +473,7 @@ function bkLabel() {
 }
 function pickBucket(price) {
   bkList = makeBuckets();
-  const target = price * 5e-6;
+  const target = tick * 3;
   bkIdx = bkList.findIndex(v => v >= target);
   if (bkIdx < 0) bkIdx = bkList.length - 1;
   bk = bkList[bkIdx]; bkLabel(); resetHeat();
@@ -508,9 +520,9 @@ function note(t) { $('#note').textContent = t; }
 
 function onBook(m) {
   const d = m.data;
-  if (m.type === 'snapshot') { bids.clear(); asks.clear(); }
-  for (const [p, s] of d.b) s === '0' ? bids.delete(p) : bids.set(p, +s);
-  for (const [p, s] of d.a) s === '0' ? asks.delete(p) : asks.set(p, +s);
+  if (m.type === 'snapshot') { ybB.clear(); ybA.clear(); }
+  for (const [p, s] of d.b) s === '0' ? ybB.delete(p) : ybB.set(p, +s);
+  for (const [p, s] of d.a) s === '0' ? ybA.delete(p) : ybA.set(p, +s);
   dirty = true;
 }
 function onKline(arr) {
@@ -532,7 +544,7 @@ function connect() {
     send('subscribe', [`orderbook.${depth}.${SYM}`, `publicTrade.${SYM}`, `kline.${tf}.${SYM}`, `tickers.${SYM}`]);
     ping = setInterval(() => send('ping'), 20000);
     setDot('live');
-    note(sinceText || 'Подключено');
+    note(sinceText() || 'Подключено');
   };
   ws.onmessage = e => {
     const m = JSON.parse(e.data);
@@ -750,10 +762,69 @@ document.addEventListener('visibilitychange', () => {
   if (hiddenAt && Date.now() - hiddenAt > 30000) {
     loadBars();
     note('Пока приложение было свёрнуто, стакан не записывался: пропуск отмечен серым');
-    setTimeout(() => note(sinceText), 8000);
+    setTimeout(() => note(sinceText()), 8000);
   }
   dirty = true;
 });
+
+/* ---------- deep book: Binance USD-M local order book (snapshot 1000 + diffs) ---------- */
+const BN_REST = 'https://fapi.binance.com', BN_WS = 'wss://fstream.binance.com/ws/';
+const bnB = new Map(), bnA = new Map();
+let bnWs = null, bnBuf = [], bnLast = 0, bnSynced = false, bnFails = 0, bnDead = false;
+function useBook(src) {
+  if (src === bookSrc) return;
+  bookSrc = src;
+  bids = src === 'binance' ? bnB : ybB; asks = src === 'binance' ? bnA : ybA;
+  note(sinceText()); dirty = true;
+}
+function bnApply(ev) {
+  for (const [p, q] of ev.b) +q === 0 ? bnB.delete(p) : bnB.set(p, +q);
+  for (const [p, q] of ev.a) +q === 0 ? bnA.delete(p) : bnA.set(p, +q);
+  bnLast = ev.u; dirty = true;
+}
+async function bnSnapshot() {
+  if (!bnWs || bnWs.readyState !== 1) return;
+  try {
+    const j = await (await fetch(`${BN_REST}/fapi/v1/depth?symbol=${SYM}&limit=1000`)).json();
+    if (j.code === -1121) { bnDead = true; bnWs.close(); return; }     // symbol not on Binance
+    if (!j.lastUpdateId) throw new Error('no snapshot');
+    const id = j.lastUpdateId, rest = bnBuf.filter(e => e.u >= id);
+    if (rest.length && rest[0].U > id) throw new Error('gap');
+    bnB.clear(); bnA.clear();
+    for (const [p, q] of j.bids) bnB.set(p, +q);
+    for (const [p, q] of j.asks) bnA.set(p, +q);
+    bnBuf = []; bnLast = id;
+    for (const e of rest) bnApply(e);
+    bnSynced = true; bnFails = 0; useBook('binance');
+  } catch (e) { bnResync(); }
+}
+function bnResync() {
+  bnSynced = false; bnBuf = [];
+  if (++bnFails > 4) { if (bnWs) bnWs.close(); return; }
+  setTimeout(bnSnapshot, 500 * bnFails);
+}
+function bnConnect() {
+  if (bnDead) return;
+  bnSynced = false; bnBuf = [];
+  bnWs = new WebSocket(BN_WS + SYM.toLowerCase() + '@depth@100ms');
+  bnWs.onopen = () => setTimeout(bnSnapshot, 400);
+  bnWs.onmessage = e => {
+    const ev = JSON.parse(e.data);
+    if (ev.e !== 'depthUpdate') return;
+    if (!bnSynced) { bnBuf.push(ev); if (bnBuf.length > 3000) bnBuf.shift(); return; }
+    if (ev.pu !== bnLast) { bnResync(); return; }
+    bnApply(ev);
+  };
+  bnWs.onclose = () => {
+    bnSynced = false; useBook('bybit');
+    if (!bnDead) setTimeout(bnConnect, Math.min(60000, 3000 * Math.max(1, bnFails)));
+  };
+}
+setInterval(() => {                 // keep the local book bounded: drop levels beyond ±15% of price
+  if (!lastClose) return;
+  const lo = lastClose * .85, hi = lastClose * 1.15;
+  for (const m of [bnB, bnA]) for (const p of m.keys()) { const x = +p; if (x < lo || x > hi) m.delete(p); }
+}, 30000);
 
 /* ---------- boot ---------- */
 (async () => {
@@ -761,6 +832,7 @@ document.addEventListener('visibilitychange', () => {
   await loadBars();
   if (lastClose != null) pickBucket(lastClose);
   connect();
+  bnConnect();
   keepAwake();
   loadOi(); loadBtc();
 })();
