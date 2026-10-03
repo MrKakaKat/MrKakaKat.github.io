@@ -91,6 +91,7 @@ const cs = ms => ms / 1000 + TZ;          // ms -> chart seconds (local time)
 let tf = '1', tick = 0.1, prec = 1;
 let bkList = [], bkIdx = 0, bk = null;
 let bar0 = null, lastBarT = null, lastClose = null;
+let bars = [];              // {h, l, v} aligned with series indices (for volume profile)
 let depth = 500;
 const bids = new Map(), asks = new Map();
 let dirty = true;
@@ -120,7 +121,7 @@ const chart = LightweightCharts.createChart($('#chart'), {
             fontFamily: "'Barlow Semi Condensed', system-ui, sans-serif", fontSize: 12 },
   grid: { vertLines: { color: 'rgba(28,43,68,.35)' }, horzLines: { color: 'rgba(28,43,68,.35)' } },
   rightPriceScale: { borderColor: '#1c2b44' },
-  timeScale: { borderColor: '#1c2b44', timeVisible: true, secondsVisible: false, rightOffset: 8, barSpacing: 8 },
+  timeScale: { borderColor: '#1c2b44', timeVisible: true, secondsVisible: false, rightOffset: 14, barSpacing: 8 },
   crosshair: { mode: 0 },
 });
 const series = chart.addCandlestickSeries({
@@ -153,11 +154,11 @@ const tmp = document.createElement('canvas'); tmp.width = W; tmp.height = H;
 const mctx = tmp.getContext('2d');
 const colImg = tctx.createImageData(1, H);
 const acc = new Float32Array(H);
-let anchorTop = null, lastK = -1, hStart = 0, lo = 0, hi = 0, sinceText = '';
+let anchorTop = null, lastK = -1, hStart = 0, qLo = 0, qHi = 0, sinceText = '';
 
 function resetHeat() {
   tctx.clearRect(0, 0, W, H);
-  anchorTop = null; lastK = -1; lo = 0; hi = 0;
+  anchorTop = null; lastK = -1; qLo = 0; qHi = 0;
   hStart = Math.floor(Date.now() / SMS) * SMS;
   const d = new Date(hStart);
   sinceText = `Стакан копится с ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
@@ -202,9 +203,9 @@ function sample() {
   nz.sort((a, b) => a - b);
   const q50 = nz[nz.length >> 1];
   const q99 = nz[Math.min(nz.length - 1, Math.floor(nz.length * .995))];
-  lo = lo ? lo * .97 + q50 * .03 : q50;
-  hi = hi ? hi * .97 + q99 * .03 : q99;
-  const la = Math.log(lo), span = Math.max(1e-6, Math.log(hi) - la);
+  qLo = qLo ? qLo * .97 + q50 * .03 : q50;
+  qHi = qHi ? qHi * .97 + q99 * .03 : q99;
+  const la = Math.log(qLo), span = Math.max(1e-6, Math.log(qHi) - la);
   const d = colImg.data;
   for (let r = 0; r < H; r++) {
     const v = acc[r], o = r * 4;
@@ -281,6 +282,9 @@ function draw() {
     };
     if (p + n <= W) seg(a, n); else { const n1 = W - p; seg(a, n1); seg(a + n1, n - n1); }
   }
+  const P = y => lastClose + (y - yA) * (bk * 10) / (yB - yA);   // y -> price
+  drawProfile(ts, P, plotW, plotH);
+  drawDom(Y, Math.abs(yB - yA) / 10, plotW, plotH);
   hctx.restore();
 
   // trade bubbles
@@ -308,6 +312,85 @@ function draw() {
   }
   octx.restore();
 }
+/* ---------- volume profile (visible range, from candle volume) ---------- */
+function drawProfile(ts, P, plotW, plotH) {
+  const vr = ts.getVisibleLogicalRange();
+  if (!vr || !bars.length) return;
+  const i0 = Math.max(0, Math.floor(vr.from)), i1 = Math.min(bars.length - 1, Math.ceil(vr.to));
+  const pTop = P(0), pBot = P(plotH);
+  const N = Math.max(20, Math.floor(plotH / 4)), step = (pTop - pBot) / N;
+  if (!(step > 0)) return;
+  const vp = new Float64Array(N);
+  for (let i = i0; i <= i1; i++) {
+    const b = bars[i]; if (!b || !(b.v > 0)) continue;
+    if (b.h < pBot || b.l > pTop) continue;
+    if (b.h - b.l < step) {             // tiny candle: whole volume into one bin
+      const n = Math.floor(((b.h + b.l) / 2 - pBot) / step);
+      if (n >= 0 && n < N) vp[n] += b.v;
+      continue;
+    }
+    const a = Math.max(0, Math.floor((b.l - pBot) / step)), z = Math.min(N - 1, Math.floor((b.h - pBot) / step));
+    const k = b.v / (b.h - b.l);
+    for (let n = a; n <= z; n++) {
+      const lo = pBot + n * step, ov = Math.min(lo + step, b.h) - Math.max(lo, b.l);
+      if (ov > 0) vp[n] += k * ov;
+    }
+  }
+  let tot = 0, mx = 0, poc = 0;
+  for (let n = 0; n < N; n++) { tot += vp[n]; if (vp[n] > mx) { mx = vp[n]; poc = n; } }
+  if (!mx) return;
+  let lo = poc, hi = poc, sum = vp[poc];             // value area 70%
+  while (sum < tot * .7 && (lo > 0 || hi < N - 1)) {
+    const dn = lo > 0 ? vp[lo - 1] : -1, up = hi < N - 1 ? vp[hi + 1] : -1;
+    if (up >= dn) sum += vp[++hi]; else sum += vp[--lo];
+  }
+  const maxW = plotW * .22, bh = plotH / N;
+  for (let n = 0; n < N; n++) {
+    if (!vp[n]) continue;
+    hctx.fillStyle = n === poc ? 'rgba(242,184,75,.6)'
+      : (n >= lo && n <= hi ? 'rgba(201,212,227,.2)' : 'rgba(201,212,227,.08)');
+    hctx.fillRect(0, plotH - (n + 1) * bh, vp[n] / mx * maxW, Math.max(1, bh - .5));
+  }
+  const yp = plotH - (poc + .5) * bh;
+  hctx.strokeStyle = 'rgba(242,184,75,.4)'; hctx.lineWidth = 1; hctx.setLineDash([4, 4]);
+  hctx.beginPath(); hctx.moveTo(0, yp); hctx.lineTo(plotW, yp); hctx.stroke(); hctx.setLineDash([]);
+}
+
+/* ---------- DOM: current book as horizontal bars at the right edge ---------- */
+const fmtSz = v => v >= 1000 ? (v / 1000).toFixed(1) + 'k' : v >= 100 ? v.toFixed(0) : v.toFixed(1);
+function bookBuckets(map) {
+  const m = new Map();
+  for (const [p, s] of map) { const b = Math.floor(+p / bk + 1e-9); m.set(b, (m.get(b) || 0) + s); }
+  return m;
+}
+function drawDom(Y, rowH, plotW, plotH) {
+  if (!bids.size || !asks.size) return;
+  const B = bookBuckets(bids), A = bookBuckets(asks);
+  let mx = 0;
+  for (const v of B.values()) if (v > mx) mx = v;
+  for (const v of A.values()) if (v > mx) mx = v;
+  if (!mx) return;
+  const maxW = Math.min(110, plotW * .3), h = Math.max(1, rowH > 3 ? rowH - 1 : rowH);
+  hctx.font = "500 11px 'Barlow Semi Condensed', system-ui, sans-serif";
+  hctx.textAlign = 'right'; hctx.textBaseline = 'middle';
+  const side = (m, fill, text) => {
+    let top = null, topS = 0;
+    hctx.fillStyle = fill;
+    for (const [b, s] of m) {
+      const y = Y((b + 1) * bk);
+      if (y < -rowH || y > plotH) continue;
+      const w = Math.sqrt(s / mx) * maxW;
+      hctx.fillRect(plotW - w, y, w, h);
+      if (s > topS) { topS = s; top = b; }
+    }
+    if (top == null) return;
+    hctx.fillStyle = text;
+    hctx.fillText(fmtSz(topS), plotW - Math.sqrt(topS / mx) * maxW - 4, Y((top + .5) * bk));
+  };
+  side(B, 'rgba(127,220,184,.5)', '#7fdcb8');
+  side(A, 'rgba(224,118,92,.55)', '#e0765c');
+}
+
 (function frame() { requestAnimationFrame(frame); if (dirty) { dirty = false; draw(); } })();
 
 /* ---------- bucket control ---------- */
@@ -351,13 +434,15 @@ async function loadInfo() {
   series.applyOptions({ priceFormat: { type: 'price', precision: prec, minMove: tick } });
 }
 async function loadBars() {
-  bar0 = null; lastBarT = null; series.setData([]);
+  bar0 = null; lastBarT = null; bars = []; series.setData([]);
   try {
     const j = await (await fetch(`${REST}/v5/market/kline?category=linear&symbol=${SYM}&interval=${tf}&limit=1000`)).json();
-    const L = j.result.list.slice().reverse().map(a => ({
+    const raw = j.result.list.slice().reverse();
+    const L = raw.map(a => ({
       time: Math.floor(+a[0] / 1000) + TZ, open: +a[1], high: +a[2], low: +a[3], close: +a[4] }));
     if (L.length) {
       series.setData(L);
+      bars = raw.map(a => ({ h: +a[2], l: +a[3], v: +a[5] }));
       bar0 = L[0].time; lastBarT = L[L.length - 1].time; lastClose = L[L.length - 1].close;
     }
   } catch (e) { note('История свечей не загрузилась, график строится с текущей минуты'); }
@@ -375,6 +460,7 @@ function onBook(m) {
   if (m.type === 'snapshot') { bids.clear(); asks.clear(); }
   for (const [p, s] of d.b) s === '0' ? bids.delete(p) : bids.set(p, +s);
   for (const [p, s] of d.a) s === '0' ? asks.delete(p) : asks.set(p, +s);
+  dirty = true;
 }
 function onKline(arr) {
   for (const k of arr) {
@@ -382,6 +468,8 @@ function onKline(arr) {
     const b = { time: Math.floor(k.start / 1000) + TZ, open: +k.open, high: +k.high, low: +k.low, close: +k.close };
     if (lastBarT != null && b.time < lastBarT) continue;
     if (bar0 == null) bar0 = b.time;
+    const rec = { h: b.high, l: b.low, v: +k.volume };
+    if (lastBarT == null || b.time > lastBarT) bars.push(rec); else bars[bars.length - 1] = rec;
     series.update(b); lastBarT = b.time; lastClose = b.close;
   }
   dirty = true;
