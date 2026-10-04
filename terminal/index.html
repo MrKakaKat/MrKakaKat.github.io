@@ -73,6 +73,10 @@ header{
 .row .c{font-size:14px;text-align:right;min-width:4.4em}
 .row .d{grid-column:1/-1;font-size:12px;color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .smsg{padding:14px 12px;color:var(--dim);font-size:13px}
+.chips{display:flex;flex-wrap:wrap;gap:4px;min-width:0}
+.chips button{all:unset;padding:3px 7px;border:1px solid var(--line);border-radius:6px;font-size:12px;color:var(--text);cursor:pointer}
+.chips button.cur{background:var(--line)}
+.row .d .rec{color:var(--live)}
 #note{
   position:absolute;left:8px;top:8px;font-size:12px;color:var(--dim);pointer-events:none;
   background:rgba(10,19,34,.75);padding:3px 7px;border-radius:5px;
@@ -113,6 +117,7 @@ header{
       <div class="seg" id="fCap"><button data-v="0">любая</button><button data-v="300000000">≥300M</button><button data-v="1000000000">≥1B</button></div></div>
     <div class="frow"><span>Сортировка</span>
       <div class="seg" id="fSort"><button data-v="atr">ATR%</button><button data-v="range">Диапазон</button><button data-v="turn">Оборот</button></div></div>
+    <div class="frow" id="recRow" hidden><span>Запись</span><div class="chips" id="recList"></div></div>
   </div>
   <div id="list"><div class="smsg">Загрузка…</div></div>
 </div>
@@ -134,6 +139,9 @@ const EDGE = 128;          // re-anchor margin (rows)
 const PERSIST_MS = 15000;  // persistence filter time constant
 const TZ = -new Date().getTimezoneOffset() * 60;
 const cs = ms => ms / 1000 + TZ;          // ms -> chart seconds (local time)
+// Android app: the recorder service keeps writing heatmap columns while the app is closed.
+const NATIVE = !!(window.Capacitor && Capacitor.isNativePlatform && Capacitor.isNativePlatform());
+const Rec = NATIVE ? Capacitor.registerPlugin('HeatRecorder') : null;
 
 /* ---------- state ---------- */
 let tf = '1', tick = 0.1, prec = 1;
@@ -202,20 +210,27 @@ const tctx = tex.getContext('2d');
 const tmp = document.createElement('canvas'); tmp.width = W; tmp.height = H;
 const mctx = tmp.getContext('2d');
 const colImg = tctx.createImageData(1, H);
-const acc = new Float32Array(H);
-let anchorTop = null, lastK = -1, hStart = 0, qLo = 0, qHi = 0, sinceHM = '';
-const pers = new Float32Array(H), shown = new Float32Array(H);
+const acc = new Float32Array(H), shown = new Float32Array(H);
+// Colour state: persistence filter + smoothed quantiles. Replayed history runs through its own copy.
+const newTone = () => ({ pers: new Float32Array(H), qLo: 0, qHi: 0 });
+let tone = newTone();
+let anchorTop = null, lastK = -1, liveK = -1, hStart = 0, sinceHM = '', fromRecording = false;
+const slotK = new Float64Array(W).fill(NaN);   // column index a live sample painted into each ring slot
 const PA = Math.exp(-SMS / PERSIST_MS);
-const sinceText = () => sinceHM ? `Стакан ${bookSrc === 'binance' ? 'Binance' : 'Bybit'} · копится с ${sinceHM}` : '';
+const GAP_FILL = 'rgba(111,129,156,0.09)';
+const sinceText = () => sinceHM
+  ? `Стакан ${bookSrc === 'binance' ? 'Binance' : 'Bybit'} · ${fromRecording ? 'запись' : 'копится'} с ${sinceHM}` : '';
+const hhmm = ms => { const d = new Date(ms); return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`; };
 
 function resetHeat() {
   tctx.clearRect(0, 0, W, H);
-  anchorTop = null; lastK = -1; qLo = 0; qHi = 0; pers.fill(0);
-  hStart = Math.floor(Date.now() / SMS) * SMS;
-  const d = new Date(hStart);
-  sinceHM = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+  anchorTop = null; lastK = -1; liveK = -1; tone = newTone(); slotK.fill(NaN); fromRecording = false;
+  const now = Math.floor(Date.now() / SMS) * SMS;
+  hStart = NATIVE ? now - W * SMS : now;   // in the app the ring before "now" is kept for recorded history
+  sinceHM = hhmm(now);
   note(sinceText());
   dirty = true;
+  if (NATIVE) loadHistory();
 }
 
 function anchor(bm) {
@@ -225,6 +240,7 @@ function anchor(bm) {
   const nt = bm + H / 2, d = nt - anchorTop;
   mctx.clearRect(0, 0, W, H); mctx.drawImage(tex, 0, 0);
   tctx.clearRect(0, 0, W, H); tctx.drawImage(tmp, 0, d);
+  const pers = tone.pers;
   if (Math.abs(d) >= H) pers.fill(0);
   else if (d > 0) { pers.copyWithin(d, 0, H - d); pers.fill(0, 0, d); }
   else if (d < 0) { pers.copyWithin(0, -d); pers.fill(0, H + d); }
@@ -236,6 +252,54 @@ function addSide(map) {
     const r = anchorTop - Math.floor(+p / bk + 1e-9);
     if (r >= 0 && r < H) acc[r] += s;
   }
+}
+
+/** Row volumes -> colImg through the persistence filter and quantile scale kept in `st`; false if empty. */
+function toneColumn(src, st, pa) {
+  const nz = [], pers = st.pers;
+  for (let r = 0; r < H; r++) {
+    pers[r] = pers[r] * pa + src[r] * (1 - pa);
+    shown[r] = src[r] > 0 ? Math.min(src[r], pers[r]) : 0;   // fresh/flickering orders stay dim
+    if (shown[r] > 0) nz.push(shown[r]);
+  }
+  if (!nz.length) return false;
+  nz.sort((a, b) => a - b);
+  const q50 = nz[nz.length >> 1];
+  const q99 = nz[Math.min(nz.length - 1, Math.floor(nz.length * .995))];
+  st.qLo = st.qLo ? st.qLo * .97 + q50 * .03 : q50;
+  st.qHi = st.qHi ? st.qHi * .97 + q99 * .03 : q99;
+  const la = Math.log(st.qLo), span = Math.max(1e-6, Math.log(st.qHi * 8) - la);   // headroom: walls far above typical size keep getting brighter
+  const d = colImg.data;
+  for (let r = 0; r < H; r++) {
+    const v = shown[r], o = r * 4;
+    if (!v) { d[o + 3] = 0; continue; }
+    const t = Math.min(1, Math.max(0, (Math.log(v) - la) / span));
+    const i = ((0.08 + 0.92 * t * t) * 255 | 0) * 4;
+    d[o] = LUT[i]; d[o + 1] = LUT[i + 1]; d[o + 2] = LUT[i + 2]; d[o + 3] = LUT[i + 3];
+  }
+  return true;
+}
+
+/**
+ * Puts colImg at column k. Columns skipped since `prev` repeat it when the gap is at most 3 columns
+ * (the recorder writes every 6 s in the background) and are marked as missing data when longer.
+ * History (live = false) never overwrites a column painted live.
+ */
+function putColumn(k, prev, live) {
+  const blocked = j => !live && ((lastK >= 0 && j <= lastK - W) || slotK[j % W] >= j);
+  tctx.fillStyle = GAP_FILL;
+  if (live || prev >= 0) {
+    for (let j = Math.max(prev + 1, k - W + 1); j < k; j++) {
+      if (blocked(j)) continue;
+      const x = j % W;
+      if (prev >= 0 && k - prev <= 4) tctx.putImageData(colImg, x, 0);
+      else { tctx.clearRect(x, 0, 1, H); if (prev >= 0) tctx.fillRect(x, 0, 1, H); }
+      if (live) slotK[x] = NaN;
+    }
+  }
+  if (blocked(k)) return;
+  tctx.putImageData(colImg, k % W, 0);
+  if (live) slotK[k % W] = k;
 }
 
 function sample() {
@@ -251,36 +315,69 @@ function sample() {
 
   anchor(Math.floor(mid / bk));
   acc.fill(0); addSide(bids); addSide(asks);
-
-  const nz = [];
-  for (let r = 0; r < H; r++) {
-    pers[r] = pers[r] * PA + acc[r] * (1 - PA);
-    shown[r] = acc[r] > 0 ? Math.min(acc[r], pers[r]) : 0;   // fresh/flickering orders stay dim
-    if (shown[r] > 0) nz.push(shown[r]);
-  }
-  if (!nz.length) return;
-  nz.sort((a, b) => a - b);
-  const q50 = nz[nz.length >> 1];
-  const q99 = nz[Math.min(nz.length - 1, Math.floor(nz.length * .995))];
-  qLo = qLo ? qLo * .97 + q50 * .03 : q50;
-  qHi = qHi ? qHi * .97 + q99 * .03 : q99;
-  const la = Math.log(qLo), span = Math.max(1e-6, Math.log(qHi * 8) - la);   // headroom: walls far above typical size keep getting brighter
-  const d = colImg.data;
-  for (let r = 0; r < H; r++) {
-    const v = shown[r], o = r * 4;
-    if (!v) { d[o + 3] = 0; continue; }
-    const t = Math.min(1, Math.max(0, (Math.log(v) - la) / span));
-    const i = ((0.08 + 0.92 * t * t) * 255 | 0) * 4;
-    d[o] = LUT[i]; d[o + 1] = LUT[i + 1]; d[o + 2] = LUT[i + 2]; d[o + 3] = LUT[i + 3];
-  }
-  tctx.fillStyle = 'rgba(111,129,156,0.09)';
-  for (let j = lastK + 1; j < k && j <= lastK + W; j++) {
-    tctx.clearRect(j % W, 0, 1, H);
-    if (lastK >= 0) tctx.fillRect(j % W, 0, 1, H);   // no data (app was paused)
-  }
-  tctx.putImageData(colImg, k % W, 0);
-  lastK = k; dirty = true;
+  if (!toneColumn(acc, tone, PA)) return;
+  putColumn(k, lastK, true);
+  lastK = liveK = k; dirty = true;
 }
+
+/* ---------- recorded history (Android app) ---------- */
+const LN_RANGE = Math.log(1e5);   // must match ColumnCodec on the native side
+let histGen = 0;
+async function loadHistory() {
+  const gen = ++histGen;
+  try {
+    const r = await Rec.getHistory({ symbol: SYM, hours: W * SMS / 3600000 });
+    if (gen !== histGen || !r || !r.count) return;
+    const buf = await (await fetch(Capacitor.convertFileSrc(r.path))).arrayBuffer();
+    if (gen === histGen) paintHistory(buf);
+  } catch (e) { /* nothing recorded for this coin: live only */ }
+}
+
+/** Columns from HistoryFile.kt ("HMH1", big-endian), resampled into the current bucket step. */
+function paintHistory(buf) {
+  const dv = new DataView(buf), bytes = new Uint8Array(buf);
+  if (dv.byteLength < 12 || dv.getUint32(0) !== 0x484d4831) return;
+  const n = dv.getInt32(4), rows = dv.getInt32(8), size = 28 + rows;
+  if (!n || dv.byteLength < 12 + n * size) return;
+  const midOf = off => (dv.getFloat64(off + 16) - rows / 2 + 0.5) * dv.getFloat64(off + 8);
+  const lastOff = 12 + (n - 1) * size;
+  if (bk == null) { pickBucket(midOf(lastOff)); return; }   // resets the heatmap and loads again
+  if (anchorTop == null) anchorTop = Math.floor(midOf(lastOff) / bk) + H / 2;
+  const st = newTone(), src = new Float32Array(H), dec = new Float64Array(256);
+  let prevK = -1, prevT = 0, firstT = 0;
+  for (let i = 0; i < n; i++) {
+    const off = 12 + i * size;
+    const t = dv.getFloat64(off), step = dv.getFloat64(off + 8), top = dv.getFloat64(off + 16), scale = dv.getFloat32(off + 24);
+    const k = Math.floor((t - hStart) / SMS);
+    if (k < 0 || k <= prevK) continue;
+    for (let q = 1; q < 256; q++) dec[q] = scale * Math.exp(((q - 1) / 254 - 1) * LN_RANGE);
+    src.fill(0);
+    for (let r = 0, p = off + 28; r < rows; r++, p++) {
+      const q = bytes[p];
+      if (!q) continue;
+      const lo = (top - r) * step, hi = lo + step;
+      const b0 = Math.floor(lo / bk + 1e-9), b1 = Math.floor(hi / bk - 1e-9);
+      for (let b = b0; b <= b1; b++) {   // spread by overlap when the recorded step differs from ours
+        const row = anchorTop - b;
+        if (row < 0 || row >= H) continue;
+        src[row] += b0 === b1 ? dec[q] : dec[q] * (Math.min(hi, (b + 1) * bk) - Math.max(lo, b * bk)) / step;
+      }
+    }
+    const pa = Math.exp(-Math.min(60000, prevT ? t - prevT : SMS) / PERSIST_MS);
+    prevT = t;
+    if (!toneColumn(src, st, pa)) continue;
+    putColumn(k, prevK, false);
+    if (!firstT) firstT = t;
+    prevK = k;
+  }
+  if (prevK < 0) return;
+  if (liveK < 0) tone = st;   // live colouring carries on from where the recording ends
+  if (prevK > lastK) lastK = prevK;
+  sinceHM = hhmm(firstT); fromRecording = true;
+  note(sinceText());
+  dirty = true;
+}
+
 setInterval(sample, 200);
 setInterval(() => dirty = true, 500);
 
@@ -688,7 +785,7 @@ function renderScr() {
     return `<div class="row${r.s === SYM ? ' cur' : ''}" data-s="${r.s}">
       <span class="s">${r.s.replace(/USDT$/, '')}</span><span class="p">${r.lp}</span>
       <span class="c ${r.chg > 0 ? 'pos' : r.chg < 0 ? 'neg' : ''}">${r.chg > 0 ? '+' : ''}${r.chg.toFixed(2)}%</span>
-      <span class="d">ATR 15м ${a ? a.v.toFixed(2) + '%' : '…'} · диап. 24ч ${r.range.toFixed(1)}% · об. $${fmtBig(r.turn)} · кап. ${cap}</span>
+      <span class="d">${recSet.has(r.s) ? '<b class="rec">● запись</b> · ' : ''}ATR 15м ${a ? a.v.toFixed(2) + '%' : '…'} · диап. 24ч ${r.range.toFixed(1)}% · об. $${fmtBig(r.turn)} · кап. ${cap}</span>
     </div>`;
   }).join('') : (scrRows.length ? '<div class="smsg">Под фильтр ничего не попало</div>' : '<div class="smsg">Загрузка…</div>'));
 }
@@ -742,9 +839,24 @@ function segInit(id, key) {
 }
 segInit('#fTurn', 'turn'); segInit('#fCap', 'cap'); segInit('#fSort', 'sort');
 function closeScr() { $('#scr').classList.remove('on'); clearInterval(scrTimer); }
+// Coins the Android recorder is writing in the background (none on the web).
+let recSet = new Set();
+async function loadWatchlist() {
+  if (!Rec) return;
+  try {
+    const w = await Rec.getWatchlist();
+    const syms = w.symbols || [];
+    recSet = new Set(syms);
+    $('#recRow').hidden = !syms.length;
+    $('#recList').innerHTML = syms.map(x =>
+      `<button data-s="${x}"${x === SYM ? ' class="cur"' : ''}>${x.replace(/USDT$/, '')}</button>`).join('');
+    renderScr();
+  } catch (e) { /* recorder not available */ }
+}
+$('#recList').onclick = e => { const b = e.target.closest('button'); if (b) location.search = '?s=' + b.dataset.s; };
 $('#openScr').onclick = () => {
   $('#scr').classList.add('on'); history.pushState({ scr: 1 }, '');
-  renderScr(); loadScr(); clearInterval(scrTimer); scrTimer = setInterval(loadScr, 60000);
+  renderScr(); loadScr(); loadWatchlist(); clearInterval(scrTimer); scrTimer = setInterval(() => { loadScr(); loadWatchlist(); }, 60000);
 };
 $('#sBack').onclick = () => history.back();
 window.addEventListener('popstate', closeScr);
@@ -757,11 +869,17 @@ async function keepAwake() {
   catch (e) { /* not critical */ }
 }
 document.addEventListener('visibilitychange', () => {
+  if (Rec) Rec.setActive({ active: document.visibilityState === 'visible' }).catch(() => {});
   if (document.visibilityState === 'hidden') { hiddenAt = Date.now(); return; }
   keepAwake();
   if (hiddenAt && Date.now() - hiddenAt > 30000) {
     loadBars();
-    note('Пока приложение было свёрнуто, стакан не записывался: пропуск отмечен серым');
+    if (NATIVE) {
+      setTimeout(loadHistory, 1500);   // after the first live column, so the gap is filled from the recording
+      note('Пока приложение было свёрнуто, запись шла в фоне');
+    } else {
+      note('Пока приложение было свёрнуто, стакан не записывался: пропуск отмечен серым');
+    }
     setTimeout(() => note(sinceText()), 8000);
   }
   dirty = true;
@@ -835,6 +953,10 @@ setInterval(() => {                 // keep the local book bounded: drop levels 
   bnConnect();
   keepAwake();
   loadOi(); loadBtc();
+  if (Rec) {
+    Rec.setActive({ active: true }).catch(() => {});
+    if (lastClose == null) loadHistory();   // no candles yet: the recording still sets the price step
+  }
 })();
 })();
 </script>

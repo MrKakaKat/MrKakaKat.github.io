@@ -13,6 +13,7 @@ import com.getcapacitor.BridgeActivity
 class MainActivity : BridgeActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        registerPlugin(HeatRecorderPlugin::class.java)   // must precede super.onCreate, which builds the bridge
         super.onCreate(savedInstanceState)
         RecorderService.start(this)
         if (Build.VERSION.SDK_INT >= 33 &&
