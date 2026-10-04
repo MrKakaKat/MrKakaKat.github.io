@@ -21,6 +21,7 @@ class RecorderService : Service() {
 
     private var wakeLock: PowerManager.WakeLock? = null
     private var recorder: Recorder? = null
+    private var picker: CoinPicker? = null
     @Volatile private var stopping = false
     @Volatile private var text = ""
 
@@ -34,11 +35,10 @@ class RecorderService : Service() {
         wakeLock = getSystemService(PowerManager::class.java)
             .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "heatmap:recorder")
             .apply { setReferenceCounted(false); acquire() }
-        recorder = Recorder(ColumnStore(historyDir(this)), ::onStatus).apply {
-            start()
-            setSymbols(DEFAULT_SYMBOLS)
-            RecorderHub.recorder = this
-        }
+        val rec = Recorder(ColumnStore(historyDir(this)), ::onStatus).apply { start() }
+        recorder = rec
+        RecorderHub.recorder = rec
+        picker = CoinPicker(CoinPicker.watchlistFile(filesDir), rec::setSymbols).apply { start() }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -56,6 +56,8 @@ class RecorderService : Service() {
     override fun onDestroy() {
         stopping = true
         RecorderHub.recorder = null
+        picker?.stop()
+        picker = null
         recorder?.stop()
         recorder = null
         wakeLock?.release()
@@ -112,7 +114,6 @@ class RecorderService : Service() {
         const val ACTION_STOP = "io.github.mrkakakat.heatmap.action.STOP"
         private const val CHANNEL_ID = "recorder"
         private const val NOTIFICATION_ID = 1
-        private val DEFAULT_SYMBOLS = listOf("BTCUSDT", "ETHUSDT", "ZECUSDT")
 
         fun historyDir(ctx: Context) = File(ctx.filesDir, "heat")
 
