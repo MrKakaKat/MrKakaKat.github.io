@@ -58,7 +58,7 @@ jobs:
           if [ "$HAS_KEYSTORE" = true ]; then task=assembleRelease; type=release; else task=assembleDebug; type=debug
             echo "::warning::Secrets ANDROID_KEYSTORE_BASE64 / ANDROID_KEYSTORE_PASSWORD / ANDROID_KEY_ALIAS are not set: building a debug APK, no release is published."
           fi
-          ./gradlew --no-daemon "$task" -PversionCode=${{ github.run_number }} -PversionName="$VERSION"
+          ./gradlew --no-daemon testDebugUnitTest "$task" -PversionCode=${{ github.run_number }} -PversionName="$VERSION"
           mkdir -p "$RUNNER_TEMP/out"
           cp app/build/outputs/apk/$type/app-$type.apk "$RUNNER_TEMP/out/heatmap-$VERSION-$type.apk"
           echo "APK=$RUNNER_TEMP/out/heatmap-$VERSION-$type.apk" >> "$GITHUB_ENV"

@@ -11,6 +11,7 @@ import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
+import java.io.File
 
 /**
  * Foreground service (type specialUse) that keeps recording order books while the app is closed.
@@ -19,33 +20,53 @@ import android.os.PowerManager
 class RecorderService : Service() {
 
     private var wakeLock: PowerManager.WakeLock? = null
+    private var recorder: Recorder? = null
+    @Volatile private var stopping = false
+    @Volatile private var text = ""
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
         createChannel()
-        goForeground(buildNotification(getString(R.string.recorder_starting)))
+        text = getString(R.string.recorder_starting)
+        goForeground(buildNotification(text))
         wakeLock = getSystemService(PowerManager::class.java)
             .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "heatmap:recorder")
             .apply { setReferenceCounted(false); acquire() }
+        recorder = Recorder(ColumnStore(historyDir(this)), ::onStatus).apply {
+            start()
+            setSymbols(DEFAULT_SYMBOLS)
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
+            stopping = true
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
             return START_NOT_STICKY
         }
         // Every startForegroundService() call must be answered with startForeground().
-        goForeground(buildNotification(getString(R.string.recorder_starting)))
+        goForeground(buildNotification(text))
         return START_STICKY
     }
 
     override fun onDestroy() {
+        stopping = true
+        recorder?.stop()
+        recorder = null
         wakeLock?.release()
         wakeLock = null
+        getSystemService(NotificationManager::class.java).cancel(NOTIFICATION_ID)
         super.onDestroy()
+    }
+
+    /** Called on the recorder thread whenever the coin list or sync state changes. */
+    private fun onStatus(st: Recorder.Status) {
+        if (stopping) return
+        text = getString(R.string.recorder_status, st.symbols.size)
+        getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, buildNotification(text))
     }
 
     private fun goForeground(n: Notification) {
@@ -89,6 +110,9 @@ class RecorderService : Service() {
         const val ACTION_STOP = "io.github.mrkakakat.heatmap.action.STOP"
         private const val CHANNEL_ID = "recorder"
         private const val NOTIFICATION_ID = 1
+        private val DEFAULT_SYMBOLS = listOf("BTCUSDT", "ETHUSDT", "ZECUSDT")
+
+        fun historyDir(ctx: Context) = File(ctx.filesDir, "heat")
 
         fun start(ctx: Context) {
             val i = Intent(ctx, RecorderService::class.java)
