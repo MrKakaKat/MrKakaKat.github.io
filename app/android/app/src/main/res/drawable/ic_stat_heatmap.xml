@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Notification icon: the launcher bands in white (status bar icons are alpha-only). -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp" android:height="24dp"
+    android:viewportWidth="100" android:viewportHeight="100">
+    <path android:fillColor="#FFFFFFFF" android:pathData="M18,22h44v6h-44z M18,31h56v7h-56z M18,41h64v8h-64z M18,52h50v7h-50z M18,62h38v6h-38z M18,71h26v6h-26z"/>
+</vector>

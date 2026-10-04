@@ -4,4 +4,7 @@
     <string name="title_activity_main">Heatmap</string>
     <string name="package_name">io.github.mrkakakat.heatmap</string>
     <string name="custom_url_scheme">io.github.mrkakakat.heatmap</string>
+    <string name="recorder_channel">Запись стаканов</string>
+    <string name="recorder_starting">Запись запускается…</string>
+    <string name="recorder_stop">Стоп</string>
 </resources>
