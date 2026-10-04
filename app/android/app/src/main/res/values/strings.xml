@@ -7,5 +7,7 @@
     <string name="recorder_channel">Запись стаканов</string>
     <string name="recorder_starting">Запись запускается…</string>
     <string name="recorder_stop">Стоп</string>
-    <string name="recorder_status">Запись %1$d монет</string>
+    <string name="recorder_status">Запись %1$d монет · %2$s · %3$s МБ сегодня</string>
+    <string name="recorder_mode_active">активно</string>
+    <string name="recorder_mode_background">фон</string>
 </resources>
