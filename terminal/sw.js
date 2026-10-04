@@ -1,7 +1,7 @@
-// Caches only the app shell (index.html + icons). Exchange data (REST, WebSocket),
-// CDN scripts and fonts are never intercepted and always go to the network.
-const CACHE = 'heatmap-v1';
-const SHELL = ['./', './index.html', './icon-192.png', './icon-512.png'];
+// Caches only the app shell (index.html, chart library, icons). Exchange data
+// (REST, WebSocket) and fonts are never intercepted and always go to the network.
+const CACHE = 'heatmap-v2';
+const SHELL = ['./', './index.html', './lightweight-charts.standalone.production.js', './icon-192.png', './icon-512.png'];
 const SHELL_URLS = new Set(SHELL.map(p => new URL(p, self.location).href));
 
 self.addEventListener('install', e => {

@@ -11,7 +11,7 @@
 <title>Heatmap · терминал</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Barlow+Semi+Condensed:wght@400;500;600&display=swap" rel="stylesheet">
-<script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+<script src="lightweight-charts.standalone.production.js"></script>
 <style>
 :root{
   --bg:#0a1322; --panel:#0f1b2e; --line:#1c2b44; --text:#c9d4e3; --dim:#6f819c;
@@ -264,7 +264,7 @@ function sample() {
   const q99 = nz[Math.min(nz.length - 1, Math.floor(nz.length * .995))];
   qLo = qLo ? qLo * .97 + q50 * .03 : q50;
   qHi = qHi ? qHi * .97 + q99 * .03 : q99;
-  const la = Math.log(qLo), span = Math.max(1e-6, Math.log(qHi) - la);
+  const la = Math.log(qLo), span = Math.max(1e-6, Math.log(qHi * 8) - la);   // headroom: walls far above typical size keep getting brighter
   const d = colImg.data;
   for (let r = 0; r < H; r++) {
     const v = shown[r], o = r * 4;
@@ -839,7 +839,8 @@ setInterval(() => {                 // keep the local book bounded: drop levels 
 })();
 </script>
 <script>
-if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
+if ('serviceWorker' in navigator && !(window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform()))
+  navigator.serviceWorker.register('sw.js').catch(() => {});
 </script>
 </body>
 </html>

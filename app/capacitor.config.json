@@ -1,0 +1,8 @@
+{
+  "appId": "io.github.mrkakakat.heatmap",
+  "appName": "Heatmap",
+  "webDir": "www",
+  "android": {
+    "backgroundColor": "#0a1322"
+  }
+}
