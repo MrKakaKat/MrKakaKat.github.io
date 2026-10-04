@@ -24,6 +24,16 @@ class MainActivity : BridgeActivity() {
         }
     }
 
+    override fun onStart() {
+        super.onStart()
+        RecorderHub.setActive(true)
+    }
+
+    override fun onStop() {
+        RecorderHub.setActive(false)
+        super.onStop()
+    }
+
     @Deprecated("Activity result API is not used here; the framework callback is enough for one permission")
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)

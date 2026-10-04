@@ -37,6 +37,7 @@ class RecorderService : Service() {
         recorder = Recorder(ColumnStore(historyDir(this)), ::onStatus).apply {
             start()
             setSymbols(DEFAULT_SYMBOLS)
+            RecorderHub.recorder = this
         }
     }
 
@@ -54,6 +55,7 @@ class RecorderService : Service() {
 
     override fun onDestroy() {
         stopping = true
+        RecorderHub.recorder = null
         recorder?.stop()
         recorder = null
         wakeLock?.release()

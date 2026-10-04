@@ -39,6 +39,8 @@ class Recorder(
         val book = LocalBook()
         var snapshotAt = Long.MAX_VALUE   // when to fetch a snapshot; MAX = not needed
         var fails = 0
+        var oldStream: String? = null     // previous-speed stream still applied until the new one delivers
+        var switchedAt = 0L
     }
 
     private val exec = ScheduledThreadPoolExecutor(1) { r -> Thread(r, "recorder").apply { isDaemon = true } }.apply {
@@ -61,6 +63,9 @@ class Recorder(
     private var lastMessageAt = 0L
     private var reconnectDelay = MIN_RECONNECT_MS
     private var requestId = 0
+
+    private val pendingUnsubscribe = LinkedHashSet<String>()
+    private var lastUnsubscribeAt = 0L
 
     private var snapshotInFlight = false
     private var snapshotsPausedUntil = 0L
@@ -87,6 +92,37 @@ class Recorder(
         http.dispatcher.executorService.shutdown()
     }
 
+    /**
+     * App on screen: 100 ms diff stream and a column every 2 s; otherwise 500 ms and 6 s.
+     * Synced books switch streams without a new snapshot: the old stream keeps being applied until
+     * the new one delivers its first event (diffs carry absolute sizes, so the overlap is harmless),
+     * then the old stream is unsubscribed.
+     */
+    fun setActive(active: Boolean) = post {
+        val next = if (active) Speed.ACTIVE else Speed.BACKGROUND
+        if (next == speed || stopped) return@post
+        val now = System.currentTimeMillis()
+        val previous = syms.keys.associateWith(::stream)
+        speed = next
+        for (s in syms.values) {
+            val old = previous.getValue(s.name)
+            if (s.book.synced) {
+                s.oldStream?.let(pendingUnsubscribe::add)
+                s.oldStream = old
+                s.switchedAt = now
+            } else {
+                pendingUnsubscribe.add(old)
+                s.oldStream?.let(pendingUnsubscribe::add)
+                s.oldStream = null
+                s.book.invalidate()
+                s.snapshotAt = now + SNAPSHOT_AFTER_SUBSCRIBE_MS
+            }
+        }
+        send("SUBSCRIBE", syms.keys.map(::stream))
+        nextColumnAt = (now / speed.columnMs + 1) * speed.columnMs
+        status()
+    }
+
     /** Coins to record; ones not trading on Binance USD-M are skipped. */
     fun setSymbols(symbols: List<String>) = post { wanted = symbols.distinct(); applySymbols() }
 
@@ -106,7 +142,7 @@ class Recorder(
         val drop = syms.values.filter { target[it.name] != it.step }
         if (drop.isNotEmpty()) {
             drop.forEach { syms.remove(it.name) }
-            send("UNSUBSCRIBE", drop.map { stream(it.name) })
+            send("UNSUBSCRIBE", drop.map { stream(it.name) } + drop.mapNotNull { it.oldStream })
         }
         val add = target.filterKeys { it !in syms }.map { (name, step) -> Sym(name, step) }
         if (add.isNotEmpty()) {
@@ -169,7 +205,8 @@ class Recorder(
         if (gen != wsGen || stopped) return
         ws = null
         wsOpen = false
-        syms.values.forEach { it.book.invalidate(); it.snapshotAt = Long.MAX_VALUE }
+        pendingUnsubscribe.clear()
+        syms.values.forEach { it.book.invalidate(); it.snapshotAt = Long.MAX_VALUE; it.oldStream = null }
         status()
         exec.schedule(::connect, reconnectDelay, TimeUnit.MILLISECONDS)
         reconnectDelay = (reconnectDelay * 2).coerceAtMost(MAX_RECONNECT_MS)
@@ -192,7 +229,12 @@ class Recorder(
 
     private fun onDepth(stream: String, symbol: String, ev: DepthEvent) {
         val s = syms[symbol] ?: return
-        if (stream != stream(symbol)) return   // leftover of a stream we already left
+        if (stream != stream(symbol)) {
+            if (stream != s.oldStream) return   // leftover of a stream we already left
+        } else if (s.oldStream != null) {
+            pendingUnsubscribe.add(s.oldStream!!)   // the new stream delivers: drop the old one
+            s.oldStream = null
+        }
         val r = s.book.onEvent(ev)
         if (r == LocalBook.Result.GAP) {
             Log.i(TAG, "$symbol: gap at ${ev.firstId}, resyncing")
@@ -210,6 +252,19 @@ class Recorder(
             val ms = speed.columnMs
             if (nextColumnAt != 0L) writeColumns(now / ms * ms)
             nextColumnAt = (now / ms + 1) * ms
+        }
+        for (s in syms.values) {
+            // A quiet coin may not send on the new stream for a while; stop paying for both.
+            if (s.oldStream != null && now - s.switchedAt > SWITCH_TIMEOUT_MS) {
+                pendingUnsubscribe.add(s.oldStream!!)
+                s.oldStream = null
+            }
+        }
+        if (pendingUnsubscribe.isNotEmpty() && now - lastUnsubscribeAt >= 1_000) {
+            pendingUnsubscribe.removeAll(syms.keys.map(::stream).toSet())   // switched back meanwhile
+            send("UNSUBSCRIBE", pendingUnsubscribe.toList())
+            pendingUnsubscribe.clear()
+            lastUnsubscribeAt = now
         }
         if (wsOpen && !snapshotInFlight && now >= snapshotsPausedUntil) {
             syms.values.firstOrNull { !it.book.synced && now >= it.snapshotAt }?.let(::fetchSnapshot)
@@ -294,6 +349,7 @@ class Recorder(
         private const val MAX_RECONNECT_MS = 60_000L
         private const val STALE_MS = 30_000L
         private const val SNAPSHOT_AFTER_SUBSCRIBE_MS = 1_000L
+        private const val SWITCH_TIMEOUT_MS = 10_000L
         private const val TRIM_FRACTION = 0.15
     }
 }
